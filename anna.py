@@ -1,11 +1,16 @@
 # anna.py
 """
-Clean inference module.
-Exposes: analyze_disaster_image(image_path) -> dict
-- Uses TensorFlow classifier (downloads from HF if needed)
-- Uses local ultralytics YOLO (if installed and yolov8n.pt present)
-  OR calls external YOLO API if YOLO_API_URL env var is set.
-- Pure Pillow + NumPy for image ops (no cv2 required)
+Deployment-safe inference module for disaster classification.
+
+Exposes:
+    analyze_disaster_image(image_path: str) -> dict
+
+Features:
+- lazy-loads TensorFlow model (downloads from HF if needed)
+- attempts to detect / optionally force preprocess_input used at training
+- reads labels.txt from repo root if present (one label per line; exact order matters)
+- optional debug output is appended to returned dict when enabled
+- does not run any training or heavy code at module import
 """
 
 import os
@@ -16,25 +21,35 @@ from typing import Optional, Dict, Any
 from PIL import Image, ImageOps
 import numpy as np
 
-# --- CONFIG: change if necessary ---
+# ---------------- CONFIG ----------------
+# URL to download model if not present locally
 HF_MODEL_URL = "https://huggingface.co/manthanpendke/disaster-classifier-model/resolve/main/disaster_classifier_finetuned.keras"
 MODEL_LOCAL = "disaster_classifier_finetuned.keras"
-LOCAL_FALLBACK = "/mnt/data/disaster_classifier_finetuned.keras"  # if running locally with model uploaded
-YOLO_LOCAL = "yolov8n.pt"  # if you keep this file in repo root, local YOLO will be used when available
+LOCAL_FALLBACK = "/mnt/data/disaster_classifier_finetuned.keras"  # if you upload model to /mnt/data
+YOLO_LOCAL = "yolov8n.pt"
 _MIN_OK_SIZE = 5 * 1024 * 1024
 
-# External YOLO API (optional). If set in environment, anna will call it:
+# External YOLO API (optional)
 YOLO_API_URL = os.environ.get("YOLO_API_URL", "").strip()
 YOLO_API_KEY = os.environ.get("YOLO_API_KEY", "").strip()
 
-# --- lazy loaded globals ---
+# Set debug mode via env var ANNA_DEBUG=1 to receive debug details in returned dict
+DEBUG = os.environ.get("ANNA_DEBUG", "") in ("1", "true", "True")
+
+# Force which preprocess to use (set env var ANNA_FORCE_PREPROCESS to vgg/resnet/mobilenet/efficientnet)
+FORCED_PREPROCESS = os.environ.get("ANNA_FORCE_PREPROCESS", "").lower().strip()
+
+# Force labels by environment variable (comma-separated) or provide labels.txt at repo root
+FORCED_LABELS = os.environ.get("ANNA_FORCE_LABELS", "").strip()  # e.g. "earthquake,flood,cyclone,wildfire"
+
+# ---------------- stateful globals (lazy loaded) ----------------
 _classifier = None
 _yolo = None
 _IMG_SIZE = (224, 224)
 _idx_to_label = None
 _preprocess_fn = None
 
-# -------------------- utilities --------------------
+# ---------------- utilities ----------------
 def _download_from_hf(url: str, dst_path: str, min_ok=_MIN_OK_SIZE):
     import requests
     session = requests.Session()
@@ -71,11 +86,11 @@ def _pil_to_numpy(img: Image.Image) -> np.ndarray:
 def _resize_for_model(pil: Image.Image, size):
     return pil.resize(size, Image.BILINEAR)
 
-# -------------------- classifier loader --------------------
+# ---------------- classifier loader ----------------
 def _guess_preprocess_fn(model):
     """
-    Try to find a suitable tf.keras.applications preprocess_input function
-    by checking popular model families. Returns function or None.
+    Try to guess a suitable preprocess_input function based on model name.
+    Returns function or None.
     """
     try:
         import tensorflow as tf
@@ -96,14 +111,12 @@ def _guess_preprocess_fn(model):
             return mod.preprocess_input
     except Exception:
         pass
-    try:
-        from tensorflow.keras.applications.vgg16 import preprocess_input as vgg_pre
-        return vgg_pre
-    except Exception:
-        pass
     return None
 
 def _load_classifier():
+    """
+    Lazy-loads the TF model and sets _IMG_SIZE and _preprocess_fn if possible.
+    """
     global _classifier, _IMG_SIZE, _preprocess_fn
     if _classifier is not None:
         return _classifier
@@ -120,11 +133,27 @@ def _load_classifier():
             _IMG_SIZE = (w, h)
     except Exception:
         _IMG_SIZE = (224, 224)
-    # detect preprocess function (try to guess)
-    _preprocess_fn = _guess_preprocess_fn(model)
+    # set preprocess fn: forced takes precedence, otherwise guess
+    if FORCED_PREPROCESS:
+        try:
+            if FORCED_PREPROCESS == "vgg":
+                from tensorflow.keras.applications.vgg16 import preprocess_input as forced
+            elif FORCED_PREPROCESS == "resnet":
+                from tensorflow.keras.applications.resnet50 import preprocess_input as forced
+            elif FORCED_PREPROCESS == "mobilenet":
+                from tensorflow.keras.applications.mobilenet_v2 import preprocess_input as forced
+            elif FORCED_PREPROCESS == "efficientnet":
+                from tensorflow.keras.applications.efficientnet import preprocess_input as forced
+            else:
+                forced = None
+            _preprocess_fn = forced
+        except Exception:
+            _preprocess_fn = None
+    if _preprocess_fn is None:
+        _preprocess_fn = _guess_preprocess_fn(model)
     return _classifier
 
-# -------------------- YOLO: local loader or external API --------------------
+# ---------------- YOLO loader or API caller ----------------
 def _load_local_yolo():
     global _yolo
     if _yolo is not None:
@@ -154,7 +183,7 @@ def _call_external_yolo_api(image_path: str, api_url: str = YOLO_API_URL, api_ke
         except Exception:
             return None
 
-# -------------------- detection -> impact score --------------------
+# ---------------- detection -> impact heuristics ----------------
 def compute_impact_from_detections(detections_json: Optional[Dict[str, Any]]) -> float:
     if not detections_json or "boxes" not in detections_json:
         return 0.0
@@ -170,10 +199,9 @@ def compute_impact_from_detections(detections_json: Optional[Dict[str, Any]]) ->
     density = total_critical_area / (img_w * img_h + 1e-9)
     return float(min(1.0, density * 10.0))
 
-# -------------------- attention / gradcam-ish --------------------
+# ---------------- attention / gradcam-ish ----------------
 def _get_attention_score(grad_model, img_array, class_idx):
     import tensorflow as tf
-    # ensure tensor
     if not tf.is_tensor(img_array):
         img_array = tf.convert_to_tensor(img_array, dtype=tf.float32)
     with tf.GradientTape() as tape:
@@ -184,11 +212,7 @@ def _get_attention_score(grad_model, img_array, class_idx):
             preds_tensor = preds_raw[-1]
         if not tf.is_tensor(preds_tensor):
             preds_tensor = tf.convert_to_tensor(preds_tensor, dtype=tf.float32)
-        try:
-            class_channel = preds_tensor[:, class_idx]
-        except Exception:
-            preds_squeezed = tf.squeeze(preds_tensor)
-            class_channel = preds_squeezed[:, class_idx]
+        class_channel = preds_tensor[:, class_idx]
     grads = tape.gradient(class_channel, last_conv_out)
     if grads is None:
         return 0.0
@@ -205,7 +229,7 @@ def _get_attention_score(grad_model, img_array, class_idx):
         return 0.0
     return float(max(0.0, min(1.0, score)))
 
-# -------------------- chaos & cyclone heuristics (PIL+NumPy) --------------------
+# ---------------- chaos / cyclone heuristics ----------------
 def _edge_density(arr_gray: np.ndarray) -> float:
     gx = np.abs(np.diff(arr_gray, axis=1))
     gy = np.abs(np.diff(arr_gray, axis=0))
@@ -233,7 +257,7 @@ def _cyclone_eye_bonus(arr_gray: np.ndarray) -> float:
         return 0.3
     return 0.0
 
-# -------------------- main analysis function --------------------
+# ---------------- main analysis ----------------
 def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
     """
     Returns:
@@ -242,11 +266,14 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
         'predicted_class': 'earthquake',
         'class_confidence': 0.9999,
         'estimated_severity': 0.478,
-        'responsible_authority': 'Local Municipality / Search & Rescue'
+        'responsible_authority': 'Local Municipality / Search & Rescue',
+        'debug': { ... }    # present only if DEBUG=True or ANNA_DEBUG=1
       }
     """
     clf = _load_classifier()
     import tensorflow as tf
+
+    # find a conv-like layer for GradCAM
     last_conv = None
     for layer in reversed(clf.layers):
         if hasattr(layer, "kernel_size"):
@@ -264,11 +291,6 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
     arr_model = _pil_to_numpy(pil_resized)
 
     global _preprocess_fn
-    if _preprocess_fn is None:
-        try:
-            _ = _load_classifier()
-        except Exception:
-            pass
     if _preprocess_fn:
         try:
             arr_pre = _preprocess_fn(arr_model.copy())
@@ -281,19 +303,18 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
     batch = np.expand_dims(arr_pre, axis=0)
 
     preds = clf.predict(batch, verbose=0)
+    # normalize preds to numpy array
     if isinstance(preds, (list, tuple)):
         candidate = preds[-1]
         try:
-            import tensorflow as _tf
-            if _tf.is_tensor(candidate):
+            if tf.is_tensor(candidate):
                 candidate = candidate.numpy()
         except Exception:
             pass
         preds_arr = np.array(candidate)
     else:
         try:
-            import tensorflow as _tf
-            if _tf.is_tensor(preds):
+            if tf.is_tensor(preds):
                 preds_arr = preds.numpy()
             else:
                 preds_arr = np.array(preds)
@@ -304,8 +325,10 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
     class_idx = int(np.argmax(probs))
     class_conf = float(probs[class_idx])
 
+    # Attention
     attention_score = _get_attention_score(grad_model, batch, class_idx)
 
+    # YOLO detections (local or external)
     impact_score = 0.0
     yolo_model = _load_local_yolo()
     detections_json = None
@@ -338,7 +361,10 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
     chaos_score = _edge_density(arr_gray)
     base_severity = (attention_score * 0.5) + (impact_score * 0.3) + (chaos_score * 0.2)
 
+    # labels (forced or from labels.txt or fallback)
     global _idx_to_label
+    if FORCED_LABELS:
+        _idx_to_label = [s.strip() for s in FORCED_LABELS.split(",") if s.strip()]
     if _idx_to_label is None:
         labf = Path("labels.txt")
         if labf.exists():
@@ -363,19 +389,42 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
     auth_func = authority_map.get(predicted_label, (lambda s: "Local Authorities"))
     responsible_authority = auth_func(final_severity)
 
-    return {
+    # prepare debug info (if enabled)
+    debug_obj = None
+    if DEBUG:
+        try:
+            # make probs serializable
+            try:
+                probs_list = [float(x) for x in probs.tolist()]
+            except Exception:
+                probs_list = np.array(probs).flatten().astype(float).tolist()
+            debug_obj = {
+                "probs": probs_list[:200],
+                "predicted_idx": class_idx,
+                "model_input_size": _IMG_SIZE,
+                "preprocess_used": getattr(_preprocess_fn, "__name__", str(_preprocess_fn)),
+                "detection_count": len(detections_json["boxes"]) if detections_json and "boxes" in detections_json else 0,
+                "model_file_hint": MODEL_LOCAL if os.path.exists(MODEL_LOCAL) else LOCAL_FALLBACK if os.path.exists(LOCAL_FALLBACK) else HF_MODEL_URL
+            }
+        except Exception:
+            debug_obj = {"debug_error": "failed to produce debug info"}
+
+    out = {
         'image_path': os.path.basename(image_path),
         'predicted_class': predicted_label,
         'class_confidence': round(class_conf, 4),
         'estimated_severity': round(final_severity, 4),
         'responsible_authority': responsible_authority
     }
+    if debug_obj is not None:
+        out['debug'] = debug_obj
+    return out
 
-# allow CLI run
+# CLI convenience
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        out = analyze_disaster_image(sys.argv[1])
-        print(json.dumps(out, indent=2))
+        o = analyze_disaster_image(sys.argv[1])
+        print(json.dumps(o, indent=2))
     else:
         print("Call analyze_disaster_image('/path/to/image.jpg')")
