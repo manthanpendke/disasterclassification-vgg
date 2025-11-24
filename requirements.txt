@@ -3,9 +3,3 @@ tensorflow==2.20.0
 pillow
 numpy
 requests
-
-# YOLO + CPU wheels
-ultralytics==8.0.227
-torch==2.1.0+cpu
-torchvision==0.16.0+cpu
--f https://download.pytorch.org/whl/cpu/torch_stable.html
