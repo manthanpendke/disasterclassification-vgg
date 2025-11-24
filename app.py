@@ -1,32 +1,13 @@
-# app.py (Streamlit wrapper)
+# app.py
 import streamlit as st
 from PIL import Image
-import tempfile
-import os
+import tempfile, os, json
 from pathlib import Path
-import json
-import streamlit as st, sys
-st.write("Python version:", sys.version)
-try:
-    import cv2
-    st.write("cv2 version:", cv2.__version__)
-except Exception as e:
-    st.error(f"cv2 import error: {e}")
-    st.stop()
-
-import streamlit as st
-try:
-    import cv2
-except Exception:
-    st.error("Missing dependency 'opencv-python-headless'. Please add it to requirements.txt and re-deploy the app.")
-    st.stop()
-
 
 st.set_page_config(page_title="Disaster Assessment", layout="centered")
-
 st.title("Disaster Assessment (VGG + YOLO)")
 
-# Provide a button to clear cached model file in instance
+# delete cached model button
 if st.button("Delete cached model file (force re-download)"):
     try:
         if os.path.exists("disaster_classifier_finetuned.keras"):
@@ -35,26 +16,26 @@ if st.button("Delete cached model file (force re-download)"):
     except Exception as e:
         st.error(f"Could not delete cached model: {e}")
 
+# upload
 uploaded = st.file_uploader("Upload an image (jpg/png/jpeg)", type=["jpg","jpeg","png"])
 if not uploaded:
     st.info("Upload an image to get analysis (Disaster, Responsible authority, Severity%).")
     st.stop()
 
-# Save uploaded image to temporary file
+# save temp
 with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
     tmp.write(uploaded.read())
     tmp_path = tmp.name
 
 st.image(Image.open(tmp_path), caption="Uploaded image", use_column_width=True)
 
-# Import the cleaned anna module
+# import anna (cleaned)
 try:
     import anna
 except Exception as e:
     st.error(f"Import failed: {e}")
     st.stop()
 
-# Run analysis
 with st.spinner("Running analysis (this may take a few seconds to load models)..."):
     try:
         result = anna.analyze_disaster_image(tmp_path)
@@ -66,22 +47,22 @@ if result is None:
     st.error("Analysis returned no result.")
     st.stop()
 
-# Convert severity to percent and label
-sev_pct = float(result.get("estimated_severity", 0.0)) * 100.0 if result.get("estimated_severity", 0.0) <= 1.0 else float(result.get("estimated_severity", 0.0))
+# severity percent & label
+sev = float(result.get("estimated_severity", 0.0))
+# if value <=1 treat as 0..1
+sev_pct = sev*100.0 if sev <= 1.0 else sev
 def sev_label(p):
     if p < 40.0: return "Low"
     if p < 80.0: return "Medium"
     return "High"
-
 label = sev_label(sev_pct)
 
-# Display outputs
+# show results
 st.subheader("Analysis Result")
 st.markdown(f"**Disaster:** {result.get('predicted_class')}")
 st.markdown(f"**Responsible authority:** {result.get('responsible_authority')}")
 st.markdown(f"**Severity:** {sev_pct:.1f}% ({label})")
 st.markdown(f"**Model confidence:** {result.get('class_confidence')}")
 
-# JSON output
 st.subheader("Raw JSON")
 st.code(json.dumps(result, indent=2))
