@@ -5,12 +5,6 @@ import tempfile
 import os
 from pathlib import Path
 import json
-import streamlit as st
-try:
-    import cv2
-except Exception:
-    st.error("Missing dependency 'opencv-python-headless'. Please add it to requirements.txt and re-deploy the app.")
-    st.stop()
 import streamlit as st, sys
 st.write("Python version:", sys.version)
 try:
@@ -18,6 +12,13 @@ try:
     st.write("cv2 version:", cv2.__version__)
 except Exception as e:
     st.error(f"cv2 import error: {e}")
+    st.stop()
+
+import streamlit as st
+try:
+    import cv2
+except Exception:
+    st.error("Missing dependency 'opencv-python-headless'. Please add it to requirements.txt and re-deploy the app.")
     st.stop()
 
 
