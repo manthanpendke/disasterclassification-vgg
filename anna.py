@@ -373,7 +373,22 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
         else:
             _idx_to_label = ["earthquake", "flood", "cyclone", "wildfire"]
 
+    # map model index -> label from labels file (or fallback)
     predicted_label = _idx_to_label[class_idx] if 0 <= class_idx < len(_idx_to_label) else f"class_{class_idx}"
+
+    # ------------------ FIX: correct observed label rotation ------------------
+    # Your deployed model was returning labels rotated:
+    #   earthquake -> flood
+    #   cyclone    -> earthquake
+    #   flood      -> cyclone
+    # To restore the true human labels, apply this correction map.
+    _label_fix_map = {
+        "flood": "earthquake",
+        "cyclone": "flood",
+        "earthquake": "cyclone"
+    }
+    predicted_label = _label_fix_map.get(predicted_label, predicted_label)
+    # -------------------------------------------------------------------------
 
     if predicted_label == "cyclone":
         base_severity += _cyclone_eye_bonus(arr_gray)
