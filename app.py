@@ -5,6 +5,13 @@ import tempfile
 import os
 from pathlib import Path
 import json
+import streamlit as st
+try:
+    import cv2
+except Exception:
+    st.error("Missing dependency 'opencv-python-headless'. Please add it to requirements.txt and re-deploy the app.")
+    st.stop()
+
 
 st.set_page_config(page_title="Disaster Assessment", layout="centered")
 
