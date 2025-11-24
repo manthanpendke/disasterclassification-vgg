@@ -1,8 +1,9 @@
 # anna.py
 """
-Clean inference module.
+Inference module with correct preprocessing for common Keras image models.
 Exposes: analyze_disaster_image(image_path) -> dict
-- Uses TensorFlow classifier (downloads from HF if needed)
+- Loads TF classifier .keras from HF if needed
+- Uses model-specific preprocess_input when available (VGG/ResNet/MobileNet)
 - Uses local ultralytics YOLO (if installed and yolov8n.pt present)
   OR calls external YOLO API if YOLO_API_URL env var is set.
 - Pure Pillow + NumPy for image ops (no cv2)
@@ -16,24 +17,24 @@ from typing import Optional, Dict, Any
 from PIL import Image, ImageOps
 import numpy as np
 
-# --- CONFIG: change if necessary ---
+# --- CONFIG ---
 HF_MODEL_URL = "https://huggingface.co/manthanpendke/disaster-classifier-model/resolve/main/disaster_classifier_finetuned.keras"
 MODEL_LOCAL = "disaster_classifier_finetuned.keras"
-LOCAL_FALLBACK = "/mnt/data/disaster_classifier_finetuned.keras"  # if running locally with model uploaded
-YOLO_LOCAL = "yolov8n.pt"  # if you keep this file in repo root, local YOLO will be used when available
+LOCAL_FALLBACK = "/mnt/data/disaster_classifier_finetuned.keras"
+YOLO_LOCAL = "yolov8n.pt"
 _MIN_OK_SIZE = 5 * 1024 * 1024
 
-# External YOLO API (optional). If set in environment, anna will call it:
 YOLO_API_URL = os.environ.get("YOLO_API_URL", "").strip()
 YOLO_API_KEY = os.environ.get("YOLO_API_KEY", "").strip()
 
-# --- lazy loaded globals ---
+# lazy globals
 _classifier = None
 _yolo = None
 _IMG_SIZE = (224, 224)
 _idx_to_label = None
+_preprocess_fn = None
 
-# -------------------- utilities --------------------
+# ---------------- utilities ----------------
 def _download_from_hf(url: str, dst_path: str, min_ok=_MIN_OK_SIZE):
     import requests
     session = requests.Session()
@@ -50,12 +51,10 @@ def _download_from_hf(url: str, dst_path: str, min_ok=_MIN_OK_SIZE):
     return dst_path
 
 def _ensure_model_file():
-    # prefer explicit fallback for dev
     if os.path.exists(LOCAL_FALLBACK):
         return LOCAL_FALLBACK
     if os.path.exists(MODEL_LOCAL) and os.path.getsize(MODEL_LOCAL) >= _MIN_OK_SIZE:
         return MODEL_LOCAL
-    # download from HF
     _download_from_hf(HF_MODEL_URL, MODEL_LOCAL)
     return MODEL_LOCAL
 
@@ -70,16 +69,51 @@ def _pil_to_numpy(img: Image.Image) -> np.ndarray:
 def _resize_for_model(pil: Image.Image, size):
     return pil.resize(size, Image.BILINEAR)
 
-# -------------------- classifier loader --------------------
+# ---------------- classifier loader ----------------
+def _guess_preprocess_fn(model):
+    """
+    Try to find a suitable tf.keras.applications preprocess_input function
+    by checking popular model families. Returns function or None.
+    """
+    try:
+        # import here to avoid global tf import at module load
+        import tensorflow as tf
+        from importlib import import_module
+        # model.name might contain 'vgg', 'resnet', 'mobilenet', etc.
+        name = getattr(model, 'name', '') or ''
+        name = name.lower()
+        # first try to match model.name
+        if 'vgg' in name:
+            mod = import_module("tensorflow.keras.applications.vgg16")
+            return mod.preprocess_input
+        if 'resnet' in name:
+            mod = import_module("tensorflow.keras.applications.resnet50")
+            return mod.preprocess_input
+        if 'mobilenet' in name:
+            mod = import_module("tensorflow.keras.applications.mobilenet_v2")
+            return mod.preprocess_input
+        if 'efficientnet' in name:
+            mod = import_module("tensorflow.keras.applications.efficientnet")
+            return mod.preprocess_input
+    except Exception:
+        pass
+    # As a last attempt, try importing a few preprocess functions and test shape
+    try:
+        from tensorflow.keras.applications.vgg16 import preprocess_input as vgg_pre
+        return vgg_pre
+    except Exception:
+        pass
+    return None
+
 def _load_classifier():
-    global _classifier, _IMG_SIZE
+    global _classifier, _IMG_SIZE, _preprocess_fn
     if _classifier is not None:
         return _classifier
     import tensorflow as tf
     model_path = _ensure_model_file()
     model = tf.keras.models.load_model(model_path, compile=False)
     _classifier = model
-    # try infer input size
+    # infer input size
     try:
         shape = model.inputs[0].shape
         h = int(shape[1]) if shape[1] is not None else None
@@ -88,9 +122,11 @@ def _load_classifier():
             _IMG_SIZE = (w, h)
     except Exception:
         _IMG_SIZE = (224, 224)
+    # detect preprocess function (try to guess)
+    _preprocess_fn = _guess_preprocess_fn(model)
     return _classifier
 
-# -------------------- YOLO: local loader or external API --------------------
+# ---------------- YOLO local / external ----------------
 def _load_local_yolo():
     global _yolo
     if _yolo is not None:
@@ -120,14 +156,14 @@ def _call_external_yolo_api(image_path: str, api_url: str = YOLO_API_URL, api_ke
         except Exception:
             return None
 
-# -------------------- detection -> impact score --------------------
+# ---------------- detection -> impact score ----------------
 def compute_impact_from_detections(detections_json: Optional[Dict[str, Any]]) -> float:
     if not detections_json or "boxes" not in detections_json:
         return 0.0
     img_w = float(detections_json.get("width", 1))
     img_h = float(detections_json.get("height", 1))
     total_critical_area = 0.0
-    critical_object_ids = [0, 2, 7]  # person, car, truck (COCO ids)
+    critical_object_ids = [0, 2, 7]
     for b in detections_json["boxes"]:
         cls = int(b.get("class_id", -1))
         if cls in critical_object_ids:
@@ -136,73 +172,46 @@ def compute_impact_from_detections(detections_json: Optional[Dict[str, Any]]) ->
     density = total_critical_area / (img_w * img_h + 1e-9)
     return float(min(1.0, density * 10.0))
 
-# -------------------- attention / gradcam-ish --------------------
+# ---------------- attention / gradcam ----------------
 def _get_attention_score(grad_model, img_array, class_idx):
-    """
-    Robust Grad-CAM-like attention score:
-    - handles preds returned as tuple/list/tensor/ndarray
-    - computes gradient of class score wrt last conv output
-    - returns a float in 0..~1 representing attention intensity+spread
-    """
     import tensorflow as tf
-    # Ensure img_array is a tensor
+    # ensure tensor
     if not tf.is_tensor(img_array):
         img_array = tf.convert_to_tensor(img_array, dtype=tf.float32)
-
     with tf.GradientTape() as tape:
         tape.watch(img_array)
         last_conv_out, preds_raw = grad_model(img_array)
-
-        # preds_raw may be (tensor,) or list/tuple or tensor
         preds_tensor = preds_raw
         if isinstance(preds_raw, (list, tuple)):
-            # take last element as the prediction logits/softmax
             preds_tensor = preds_raw[-1]
-
-        # Convert numpy arrays to tensors if necessary
         if not tf.is_tensor(preds_tensor):
             preds_tensor = tf.convert_to_tensor(preds_tensor, dtype=tf.float32)
-
-        # Ensure preds_tensor has shape (batch, classes)
-        # Now index the desired class
+        # index class channel
         try:
             class_channel = preds_tensor[:, class_idx]
         except Exception:
-            # Fallback: try squeeze if preds_tensor is (batch,1,classes) etc.
             preds_squeezed = tf.squeeze(preds_tensor)
             class_channel = preds_squeezed[:, class_idx]
-
-    # grads: gradient of class channel wrt last_conv_out
     grads = tape.gradient(class_channel, last_conv_out)
     if grads is None:
         return 0.0
-
-    # pooled grads: mean over spatial dimensions
     pooled_grads = tf.reduce_mean(grads, axis=(0,1,2))
-
-    # compute weighted combination (tensordot over channel axis)
-    # last_conv_out[0] shape: (H, W, C)
     weighted_map = tf.tensordot(last_conv_out[0], pooled_grads, axes=[[2],[0]])
-    # ReLU and normalize
     cam = tf.maximum(weighted_map, 0.0)
     cam_max = tf.reduce_max(cam)
     cam = cam / (cam_max + 1e-9)
     cam_np = cam.numpy()
     intensity = float(np.mean(cam_np))
     spread = float(np.sum(cam_np > (np.max(cam_np) * 0.5)) / (cam_np.size + 1e-9)) if np.max(cam_np) > 0 else 0.0
-    # combine intensity and spread (same weighting as before)
     score = float((intensity * 0.5 + spread * 0.5) * 2.0)
-    # clamp
     if not np.isfinite(score):
         return 0.0
     return float(max(0.0, min(1.0, score)))
 
-# -------------------- chaos & cyclone heuristics (PIL+NumPy) --------------------
+# ---------------- chaos & cyclone heuristics ----------------
 def _edge_density(arr_gray: np.ndarray) -> float:
-    # simple diff-based edges
     gx = np.abs(np.diff(arr_gray, axis=1))
     gy = np.abs(np.diff(arr_gray, axis=0))
-    # compose
     mag = np.zeros_like(arr_gray, dtype=np.float32)
     mag[:gx.shape[0], :gx.shape[1]] += gx.astype(np.float32)
     mag[:gy.shape[0], :gy.shape[1]] += gy.astype(np.float32)
@@ -227,20 +236,9 @@ def _cyclone_eye_bonus(arr_gray: np.ndarray) -> float:
         return 0.3
     return 0.0
 
-# -------------------- main analysis function --------------------
+# ---------------- main analysis ----------------
 def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        'image_path': '5.jpg',
-        'predicted_class': 'earthquake',
-        'class_confidence': 0.9999,
-        'estimated_severity': 0.478,
-        'responsible_authority': 'Local Municipality / Search & Rescue'
-      }
-    """
     clf = _load_classifier()
-    # grad model: find a conv-like layer
     import tensorflow as tf
     last_conv = None
     for layer in reversed(clf.layers):
@@ -251,27 +249,36 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
         raise RuntimeError("No conv layer found in classifier")
     grad_model = tf.keras.Model(inputs=clf.inputs, outputs=[last_conv.output, clf.output])
 
-    # load image via PIL
     pil = Image.open(image_path).convert("RGB")
     arr_gray = np.array(ImageOps.grayscale(pil)).astype(np.float32)
 
-    # classifier prep
     target_w, target_h = _IMG_SIZE
-    try:
-        target_w, target_h = _IMG_SIZE
-    except Exception:
-        target_w, target_h = (224, 224)
     pil_resized = _resize_for_model(pil, (target_w, target_h))
-    arr_model = _pil_to_numpy(pil_resized) / 255.0
-    batch = np.expand_dims(arr_model, axis=0)
+    arr_model = _pil_to_numpy(pil_resized)
 
-    # predict
+    # APPLY MODEL-SPECIFIC PREPROCESSING IF AVAILABLE
+    global _preprocess_fn
+    if _preprocess_fn is None:
+        # attempt lazy init if not present
+        try:
+            _ = _load_classifier()
+        except Exception:
+            pass
+    if _preprocess_fn:
+        try:
+            # preprocess expects shape (H,W,3) and returns same shaped array
+            arr_pre = _preprocess_fn(arr_model.copy())
+            arr_pre = np.array(arr_pre).astype(np.float32)
+        except Exception:
+            arr_pre = arr_model / 255.0
+    else:
+        arr_pre = arr_model / 255.0
+
+    batch = np.expand_dims(arr_pre, axis=0)
+
+    # prediction (handle tuple/list returns robustly)
     preds = clf.predict(batch, verbose=0)
-    # Ensure preds is an array-like (handle tuple/list returns)
     if isinstance(preds, (list, tuple)):
-        # pick first element that looks like class probabilities
-        # prefer last item typically containing classifier output
-        # convert to numpy if tensor
         candidate = preds[-1]
         try:
             import tensorflow as _tf
@@ -281,7 +288,6 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
             pass
         preds_arr = np.array(candidate)
     else:
-        # single ndarray/tensor result
         try:
             import tensorflow as _tf
             if _tf.is_tensor(preds):
@@ -291,21 +297,19 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
         except Exception:
             preds_arr = np.array(preds)
 
-    # get probabilities and class index
     probs = preds_arr[0] if preds_arr.ndim > 1 else preds_arr
     class_idx = int(np.argmax(probs))
     class_conf = float(probs[class_idx])
 
-    # attention score
+    # attention
     attention_score = _get_attention_score(grad_model, batch, class_idx)
 
-    # YOLO: try local first, then external API
+    # YOLO detections
     impact_score = 0.0
     yolo_model = _load_local_yolo()
     detections_json = None
     if yolo_model is not None:
         try:
-            # ultralytics accepts PIL image
             res = yolo_model(pil, verbose=False)
             if res:
                 r = res[0]
@@ -322,7 +326,6 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
         except Exception:
             detections_json = None
 
-    # external YOLO if configured and no local detections
     if detections_json is None and YOLO_API_URL:
         detections_json = _call_external_yolo_api(image_path)
 
@@ -334,7 +337,6 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
     chaos_score = _edge_density(arr_gray)
     base_severity = (attention_score * 0.5) + (impact_score * 0.3) + (chaos_score * 0.2)
 
-    # load labels (best-effort)
     global _idx_to_label
     if _idx_to_label is None:
         labf = Path("labels.txt")
@@ -351,7 +353,6 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
 
     final_severity = float(min(1.0, base_severity))
 
-    # authority mapping (same logic as your notebook)
     authority_map = {
         'cyclone':    (lambda s: 'State Emergency Services (SES)' if s < 0.5 else 'National Disaster Response Force (NDRF)'),
         'earthquake': (lambda s: 'Local Municipality / Search & Rescue' if s < 0.5 else 'NDRF + State Government'),
@@ -369,7 +370,6 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
         'responsible_authority': responsible_authority
     }
 
-# Convenience: allow CLI run
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
