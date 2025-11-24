@@ -1,6 +1,10 @@
 streamlit>=1.24
-tensorflow
+tensorflow==2.14.0
 pillow
 numpy
-ultralytics
 requests
+
+# lightweight YOLO support
+ultralytics==8.0.227
+torch==2.1.0
+torchvision==0.16.0
