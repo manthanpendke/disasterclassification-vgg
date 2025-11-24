@@ -138,20 +138,64 @@ def compute_impact_from_detections(detections_json: Optional[Dict[str, Any]]) ->
 
 # -------------------- attention / gradcam-ish --------------------
 def _get_attention_score(grad_model, img_array, class_idx):
+    """
+    Robust Grad-CAM-like attention score:
+    - handles preds returned as tuple/list/tensor/ndarray
+    - computes gradient of class score wrt last conv output
+    - returns a float in 0..~1 representing attention intensity+spread
+    """
     import tensorflow as tf
+    # Ensure img_array is a tensor
+    if not tf.is_tensor(img_array):
+        img_array = tf.convert_to_tensor(img_array, dtype=tf.float32)
+
     with tf.GradientTape() as tape:
-        last_conv, preds = grad_model(img_array)
-        class_channel = preds[:, class_idx]
-    grads = tape.gradient(class_channel, last_conv)
+        tape.watch(img_array)
+        last_conv_out, preds_raw = grad_model(img_array)
+
+        # preds_raw may be (tensor,) or list/tuple or tensor
+        preds_tensor = preds_raw
+        if isinstance(preds_raw, (list, tuple)):
+            # take last element as the prediction logits/softmax
+            preds_tensor = preds_raw[-1]
+
+        # Convert numpy arrays to tensors if necessary
+        if not tf.is_tensor(preds_tensor):
+            preds_tensor = tf.convert_to_tensor(preds_tensor, dtype=tf.float32)
+
+        # Ensure preds_tensor has shape (batch, classes)
+        # Now index the desired class
+        try:
+            class_channel = preds_tensor[:, class_idx]
+        except Exception:
+            # Fallback: try squeeze if preds_tensor is (batch,1,classes) etc.
+            preds_squeezed = tf.squeeze(preds_tensor)
+            class_channel = preds_squeezed[:, class_idx]
+
+    # grads: gradient of class channel wrt last_conv_out
+    grads = tape.gradient(class_channel, last_conv_out)
     if grads is None:
         return 0.0
+
+    # pooled grads: mean over spatial dimensions
     pooled_grads = tf.reduce_mean(grads, axis=(0,1,2))
-    cam = tf.squeeze(last_conv[0] @ pooled_grads[..., tf.newaxis])
-    cam = tf.maximum(cam, 0) / (tf.math.reduce_max(cam) + 1e-9)
-    cam = cam.numpy()
-    intensity = float(np.mean(cam))
-    spread = float(np.sum(cam > (np.max(cam) * 0.5)) / (cam.size + 1e-9)) if np.max(cam) > 0 else 0.0
-    return float((intensity * 0.5 + spread * 0.5) * 2.0)
+
+    # compute weighted combination (tensordot over channel axis)
+    # last_conv_out[0] shape: (H, W, C)
+    weighted_map = tf.tensordot(last_conv_out[0], pooled_grads, axes=[[2],[0]])
+    # ReLU and normalize
+    cam = tf.maximum(weighted_map, 0.0)
+    cam_max = tf.reduce_max(cam)
+    cam = cam / (cam_max + 1e-9)
+    cam_np = cam.numpy()
+    intensity = float(np.mean(cam_np))
+    spread = float(np.sum(cam_np > (np.max(cam_np) * 0.5)) / (cam_np.size + 1e-9)) if np.max(cam_np) > 0 else 0.0
+    # combine intensity and spread (same weighting as before)
+    score = float((intensity * 0.5 + spread * 0.5) * 2.0)
+    # clamp
+    if not np.isfinite(score):
+        return 0.0
+    return float(max(0.0, min(1.0, score)))
 
 # -------------------- chaos & cyclone heuristics (PIL+NumPy) --------------------
 def _edge_density(arr_gray: np.ndarray) -> float:
@@ -223,7 +267,32 @@ def analyze_disaster_image(image_path: str) -> Dict[str, Any]:
 
     # predict
     preds = clf.predict(batch, verbose=0)
-    probs = preds[0]
+    # Ensure preds is an array-like (handle tuple/list returns)
+    if isinstance(preds, (list, tuple)):
+        # pick first element that looks like class probabilities
+        # prefer last item typically containing classifier output
+        # convert to numpy if tensor
+        candidate = preds[-1]
+        try:
+            import tensorflow as _tf
+            if _tf.is_tensor(candidate):
+                candidate = candidate.numpy()
+        except Exception:
+            pass
+        preds_arr = np.array(candidate)
+    else:
+        # single ndarray/tensor result
+        try:
+            import tensorflow as _tf
+            if _tf.is_tensor(preds):
+                preds_arr = preds.numpy()
+            else:
+                preds_arr = np.array(preds)
+        except Exception:
+            preds_arr = np.array(preds)
+
+    # get probabilities and class index
+    probs = preds_arr[0] if preds_arr.ndim > 1 else preds_arr
     class_idx = int(np.argmax(probs))
     class_conf = float(probs[class_idx])
 
