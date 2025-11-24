@@ -3,28 +3,27 @@ import streamlit as st
 import traceback
 import os
 import json
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
-# Ensure repo root is importable and import your anna.py (uploaded file)
-# anna.py must expose analyze_disaster_image(image_path)
+# Import anna (deployment-safe module)
 try:
-    import anna  # uses the uploaded anna.py you provided. See file used in this project.
-except Exception as e:
-    st.error("Import failed for `anna.py`. See details below.")
-    st.stop()
+    import anna
+except Exception:
+    st.set_page_config(page_title="Disaster Classifier (Anna)", layout="centered")
+    st.title("Disaster App — import error")
+    st.error("Import failed for anna.py. Check server logs for the full traceback.")
+    st.code(traceback.format_exc())
+    raise
 
 st.set_page_config(page_title="Disaster Classifier (Anna)", layout="centered")
-
 st.title("Disaster App — using anna.py backend")
-st.caption("Uploads an image and runs `anna.analyze_disaster_image` prediction logic (no rewrite).")
+st.caption("Uploads an image and runs anna.analyze_disaster_image prediction logic.")
 
-# Button to delete cached model files (anna.py uses MODEL_LOCAL or LOCAL_FALLBACK)
+# Model cache removal convenience
 MODEL_FILES = [
-    "disaster_classifier_finetuned.keras",     # common MODEL_LOCAL name
-    "/mnt/data/disaster_classifier_finetuned.keras",  # LOCAL_FALLBACK
-    "disaster_classifier.keras",
-    "/mnt/data/disaster_classifier.keras"
+    "disaster_classifier_finetuned.keras",
+    "/mnt/data/disaster_classifier_finetuned.keras",
 ]
 
 def delete_cached_models():
@@ -47,71 +46,64 @@ if st.button("Delete cached model file (force re-download)"):
 
 st.markdown("### Upload an image (jpg/png/jpeg)")
 
-uploaded = st.file_uploader("", type=["jpg", "jpeg", "png"], accept_multiple_files=False)
+# Provide non-empty label (accessibility warning suppression)
+uploaded = st.file_uploader("Choose an image file", type=["jpg", "jpeg", "png"], accept_multiple_files=False)
 
-# helper: severity label
 def severity_label(percent: float) -> str:
-    # percent is 0..100
     if percent < 40:
         return "Low"
     if percent < 80:
         return "Medium"
     return "High"
 
-# run analysis and display
 if uploaded is not None:
-    # save to a temp file and call anna.analyze_disaster_image
+    # save uploaded to temp file
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded.name)[1]) as tmp:
-            tmp_path = tmp.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix) as tmp:
             tmp.write(uploaded.getbuffer())
-        st.image(tmp_path, caption="Uploaded image", use_column_width=True)
+            tmp_path = tmp.name
+        st.image(tmp_path, caption="Uploaded image", use_container_width=True)
         st.info("Running analysis (this may take a few seconds to load models)...")
-
-        # call your analyze function
+        # call anna
         try:
             result = anna.analyze_disaster_image(tmp_path)
-        except Exception as e:
+        except Exception:
             st.error("Analysis failed. See traceback below.")
             st.code(traceback.format_exc())
-            # cleanup temp file
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-        else:
-            # expected fields from your anna: predicted_class, class_confidence, estimated_severity, responsible_authority
-            st.success("Analysis complete.")
-            st.markdown("## Result")
-            predicted = result.get("predicted_class", "unknown")
-            conf = result.get("class_confidence", None)
-            sev = result.get("estimated_severity", 0.0)
-            auth = result.get("responsible_authority", "Local Authorities")
-            # format
-            sev_percent = round(float(sev)*100, 2)
-            sev_level = severity_label(sev_percent)
+            raise
 
-            st.write(f"**Disaster:**  {predicted}")
-            if conf is not None:
-                st.write(f"**Class confidence:**  {conf}")
-            st.write(f"**Estimated severity:**  {sev_percent}%")
-            st.write(f"**Severity level:**  {sev_level}")
-            st.write(f"**Responsible authority:**  {auth}")
+        # Present result
+        st.success("Analysis complete.")
+        st.markdown("## Result")
+        predicted = result.get("predicted_class", "unknown")
+        conf = result.get("class_confidence", None)
+        sev = result.get("estimated_severity", 0.0)
+        auth = result.get("responsible_authority", "Local Authorities")
+        sev_percent = round(float(sev) * 100, 2) if float(sev) <= 1.0 else round(float(sev), 2)
+        sev_level = severity_label(sev_percent)
 
-            # show raw json for debugging
-            with st.expander("Raw output JSON"):
-                st.json(result)
+        st.write(f"**Disaster:**  {predicted}")
+        if conf is not None:
+            st.write(f"**Class confidence:**  {conf}")
+        st.write(f"**Estimated severity:**  {sev_percent}%")
+        st.write(f"**Severity level:**  {sev_level}")
+        st.write(f"**Responsible authority:**  {auth}")
 
-            # optional: download result
-            outfn = Path(tmp_path).stem + "_analysis.json"
-            st.download_button("Download result JSON", json.dumps(result, indent=2), file_name=outfn, mime="application/json")
+        # Raw JSON
+        with st.expander("Raw output JSON"):
+            st.json(result)
 
-            # cleanup temp file
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+        # Debug block if present
+        if "debug" in result:
+            with st.expander("Debug internals (from anna)"):
+                st.json(result["debug"])
 
-    except Exception as e:
-        st.error("Unexpected error while handling the uploaded file.")
-        st.code(traceback.format_exc())
+        # allow download
+        outfn = Path(tmp_path).stem + "_analysis.json"
+        st.download_button("Download result JSON", json.dumps(result, indent=2), file_name=outfn, mime="application/json")
+
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
