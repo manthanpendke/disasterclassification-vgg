@@ -2,6 +2,6 @@ streamlit>=1.24
 tensorflow
 pillow
 numpy
-opencv-python-headless
+opencv-python-headless 
 ultralytics
 requests
