@@ -1,5 +1,7 @@
 streamlit>=1.24
-tensorflow==2.20.0
 pillow
 numpy
 requests
+opencv-python-headless
+ultralytics
+tensorflow
