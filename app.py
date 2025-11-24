@@ -11,6 +11,14 @@ try:
 except Exception:
     st.error("Missing dependency 'opencv-python-headless'. Please add it to requirements.txt and re-deploy the app.")
     st.stop()
+import streamlit as st, sys
+st.write("Python version:", sys.version)
+try:
+    import cv2
+    st.write("cv2 version:", cv2.__version__)
+except Exception as e:
+    st.error(f"cv2 import error: {e}")
+    st.stop()
 
 
 st.set_page_config(page_title="Disaster Assessment", layout="centered")
