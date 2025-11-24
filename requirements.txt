@@ -1,7 +1,5 @@
-fastapi
-uvicorn[standard]
+streamlit>=1.24
+tensorflow==2.20.0
 pillow
 numpy
-ultralytics==8.0.227
-torch==2.1.0  # or appropriate version for the host (if using GPU, use the cuda wheel)
-torchvision==0.16.0
+requests
