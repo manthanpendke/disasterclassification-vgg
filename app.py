@@ -17,7 +17,7 @@ except Exception:
     raise
 
 st.set_page_config(page_title="Disaster Classifier (Anna)", layout="centered")
-st.title("Disaster App — using anna.py backend")
+st.title("Disaster App")
 st.caption("Uploads an image and runs anna.analyze_disaster_image prediction logic.")
 
 # Model cache removal convenience
